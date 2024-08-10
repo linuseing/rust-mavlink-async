@@ -48,7 +48,7 @@ pub mod bytes_mut;
 mod connection;
 pub mod error;
 #[cfg(feature = "std")]
-pub use self::connection::{connect, MavConnection};
+pub use self::connection::{connect, MavConnection, AsyncMavConnection, async_connect};
 
 #[cfg(any(feature = "embedded", feature = "embedded-hal-02"))]
 pub mod embedded;
