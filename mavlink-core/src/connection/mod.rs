@@ -1,6 +1,7 @@
 use crate::{MavFrame, MavHeader, MavlinkVersion, Message};
 
 use std::io::{self};
+use async_trait::async_trait;
 
 #[cfg(feature = "tcp")]
 mod tcp;
@@ -12,6 +13,7 @@ mod udp;
 mod direct_serial;
 
 mod file;
+mod async_udp;
 
 /// A MAVLink connection
 pub trait MavConnection<M: Message> {
@@ -46,6 +48,42 @@ pub trait MavConnection<M: Message> {
     fn send_default(&self, data: &M) -> Result<usize, crate::error::MessageWriteError> {
         let header = MavHeader::default();
         self.send(&header, data)
+    }
+}
+
+#[async_trait]
+pub trait AsyncMavConnection<M: Message + Sync> {
+    /// Receive a mavlink message asynchronously.
+    ///
+    /// Waits until a valid frame is received, ignoring invalid messages.
+    async fn recv(&self) -> Result<(MavHeader, M), crate::error::MessageReadError>;
+
+    /// Send a mavlink message asynchronously.
+    async fn send(&self, header: &MavHeader, data: &M) -> Result<usize, crate::error::MessageWriteError>;
+
+    fn set_protocol_version(&mut self, version: MavlinkVersion);
+    fn get_protocol_version(&self) -> MavlinkVersion;
+
+    /// Write whole frame asynchronously.
+    async fn send_frame(&self, frame: &MavFrame<M>) -> Result<usize, crate::error::MessageWriteError> {
+        self.send(&frame.header, &frame.msg).await
+    }
+
+    /// Read whole frame asynchronously.
+    async fn recv_frame(&self) -> Result<MavFrame<M>, crate::error::MessageReadError> {
+        let (header, msg) = self.recv().await?;
+        let protocol_version = self.get_protocol_version();
+        Ok(MavFrame {
+            header,
+            msg,
+            protocol_version,
+        })
+    }
+
+    /// Send a message with default header asynchronously.
+    async fn send_default(&self, data: &M) -> Result<usize, crate::error::MessageWriteError> {
+        let header = MavHeader::default();
+        self.send(&header, data).await
     }
 }
 
@@ -98,6 +136,26 @@ pub fn connect<M: Message>(address: &str) -> io::Result<Box<dyn MavConnection<M>
         }
     } else if address.starts_with("file") {
         Ok(Box::new(file::open(&address["file:".len()..])?))
+    } else {
+        protocol_err
+    }
+}
+
+pub async fn async_connect<M: Message + Send + Sync>(address: &str) -> io::Result<Box<dyn AsyncMavConnection<M> + Sync + Send>> {
+    let protocol_err = Err(io::Error::new(
+        io::ErrorKind::AddrNotAvailable,
+        "Protocol unsupported",
+    ));
+
+    if cfg!(feature = "udp") && address.starts_with("udp") {
+        #[cfg(feature = "udp")]
+        {
+            async_udp::select_protocol(address).await
+        }
+        #[cfg(not(feature = "udp"))]
+        {
+            protocol_err
+        }
     } else {
         protocol_err
     }

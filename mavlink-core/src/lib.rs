@@ -40,6 +40,7 @@ use peek_reader::PeekReader;
 use crate::{bytes::Bytes, error::ParserError};
 
 use crc_any::CRCu16;
+use tokio::io::AsyncRead;
 
 pub mod bytes;
 pub mod bytes_mut;
@@ -51,8 +52,11 @@ pub use self::connection::{connect, MavConnection};
 
 #[cfg(any(feature = "embedded", feature = "embedded-hal-02"))]
 pub mod embedded;
+mod async_peek_reader;
+
 #[cfg(any(feature = "embedded", feature = "embedded-hal-02"))]
 use embedded::{Read, Write};
+use crate::async_peek_reader::AsyncPeekReader;
 
 pub const MAX_FRAME_SIZE: usize = 280;
 
@@ -223,6 +227,17 @@ pub fn read_versioned_msg<M: Message, R: Read>(
         MavlinkVersion::V1 => read_v1_msg(r),
     }
 }
+
+pub async fn async_read_versioned_msg<M: Message, R: AsyncRead + Unpin>(
+    r: &mut AsyncPeekReader<R>,
+    version: MavlinkVersion,
+) -> Result<(MavHeader, M), error::MessageReadError> {
+    match version {
+        MavlinkVersion::V2 => async_read_v2_msg(r).await,
+        MavlinkVersion::V1 => async_read_v1_msg(r).await,
+    }
+}
+
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 // Follow protocol definition: `<https://mavlink.io/en/guide/serialization.html#v1_packet_format>`
@@ -395,6 +410,40 @@ pub fn read_v1_raw_message<M: Message, R: Read>(
     }
 }
 
+pub async fn async_read_v1_raw_message<M: Message, R: AsyncRead + Unpin>(
+    reader: &mut AsyncPeekReader<R>,
+) -> Result<MAVLinkV1MessageRaw, error::MessageReadError> {
+    loop {
+        loop {
+            // search for the magic framing value indicating start of mavlink message
+            if reader.read_u8().await? == MAV_STX {
+                break;
+            }
+        }
+
+        let mut message = MAVLinkV1MessageRaw::new();
+
+        message.0[0] = MAV_STX;
+        let header = &reader.peek_exact(MAVLinkV1MessageRaw::HEADER_SIZE).await?
+            [..MAVLinkV1MessageRaw::HEADER_SIZE];
+        message.mut_header().copy_from_slice(header);
+        let packet_length = message.raw_bytes().len() - 1;
+        let payload_and_checksum =
+            &reader.peek_exact(packet_length).await?[MAVLinkV1MessageRaw::HEADER_SIZE..packet_length];
+        message
+            .mut_payload_and_checksum()
+            .copy_from_slice(payload_and_checksum);
+
+        // retry if CRC failed after previous STX
+        // (an STX byte may appear in the middle of a message)
+        if message.has_valid_crc::<M>() {
+            reader.consume(message.raw_bytes().len() - 1);
+            return Ok(message);
+        }
+    }
+}
+
+
 /// Async read a raw buffer with the mavlink message
 /// V1 maximum size is 263 bytes: `<https://mavlink.io/en/guide/serialization.html>`
 ///
@@ -459,6 +508,29 @@ pub fn read_v1_msg<M: Message, R: Read>(
         )
     })
     .map_err(|err| err.into())
+}
+
+pub async fn async_read_v1_msg<M: Message, R: AsyncRead + Unpin>(
+    r: &mut AsyncPeekReader<R>,
+) -> Result<(MavHeader, M), error::MessageReadError> {
+    let message = async_read_v1_raw_message::<M, _>(r).await?;
+
+    M::parse(
+        MavlinkVersion::V1,
+        u32::from(message.message_id()),
+        message.payload(),
+    )
+        .map(|msg| {
+            (
+                MavHeader {
+                    sequence: message.sequence(),
+                    system_id: message.system_id(),
+                    component_id: message.component_id(),
+                },
+                msg,
+            )
+        })
+        .map_err(|err| err.into())
 }
 
 /// Async read a MAVLink v1 message from a Read stream.
@@ -691,6 +763,38 @@ pub fn read_v2_raw_message<M: Message, R: Read>(
     }
 }
 
+pub async fn async_read_v2_raw_message<M: Message, R: AsyncRead + Unpin>(
+    reader: &mut AsyncPeekReader<R>,
+) -> Result<MAVLinkV2MessageRaw, error::MessageReadError> {
+    loop {
+        loop {
+            // search for the magic framing value indicating start of mavlink message
+            if reader.read_u8().await? == MAV_STX_V2 {
+                break;
+            }
+        }
+
+        let mut message = MAVLinkV2MessageRaw::new();
+
+        message.0[0] = MAV_STX_V2;
+        let header = &reader.peek_exact(MAVLinkV2MessageRaw::HEADER_SIZE).await?
+            [..MAVLinkV2MessageRaw::HEADER_SIZE];
+        message.mut_header().copy_from_slice(header);
+        let packet_length = message.raw_bytes().len() - 1;
+        let payload_and_checksum_and_sign =
+            &reader.peek_exact(packet_length).await?[MAVLinkV2MessageRaw::HEADER_SIZE..packet_length];
+        message
+            .mut_payload_and_checksum_and_sign()
+            .copy_from_slice(payload_and_checksum_and_sign);
+
+        if message.has_valid_crc::<M>() {
+            reader.consume(message.raw_bytes().len() - 1);
+            return Ok(message);
+        }
+    }
+}
+
+
 /// Async read a raw buffer with the mavlink message
 /// V2 maximum size is 280 bytes: `<https://mavlink.io/en/guide/serialization.html>`
 ///
@@ -738,6 +842,25 @@ pub fn read_v2_msg<M: Message, R: Read>(
     read: &mut PeekReader<R>,
 ) -> Result<(MavHeader, M), error::MessageReadError> {
     let message = read_v2_raw_message::<M, _>(read)?;
+
+    M::parse(MavlinkVersion::V2, message.message_id(), message.payload())
+        .map(|msg| {
+            (
+                MavHeader {
+                    sequence: message.sequence(),
+                    system_id: message.system_id(),
+                    component_id: message.component_id(),
+                },
+                msg,
+            )
+        })
+        .map_err(|err| err.into())
+}
+
+pub async fn async_read_v2_msg<M: Message, R: AsyncRead + Unpin>(
+    read: &mut AsyncPeekReader<R>,
+) -> Result<(MavHeader, M), error::MessageReadError> {
+    let message = async_read_v2_raw_message::<M, _>(read).await?;
 
     M::parse(MavlinkVersion::V2, message.message_id(), message.payload())
         .map(|msg| {
